@@ -1,177 +1,149 @@
 package main
 
 import (
-	"bufio"
 	"encoding/csv"
-	"fmt"
+	"flag"
 	"io"
-	"io/ioutil"
 	"log"
-	"math"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 )
 
-type result int
-
-const (
-	resultNoData = iota
-	resultFail
-	resultSuccess
-)
-
-type dateValue struct {
-	DV        map[time.Time]float64
+type datePrice struct {
+	Day2Price map[time.Time]float64
 	FirstDate time.Time
 	LastDate  time.Time
 }
 
 func main() {
+	maxWithdrawRate := flag.Float64("max", 0, "max withdraw rate. e.g., 0.04")
+	minWithdrawRate := flag.Float64("min", 0, "min withdraw rate e.g., 0.03")
+	yearToSpend := flag.Int("y", 0, "year to spend. e.g., 30")
+	dividendTaxRate := flag.Float64("t", 0, "tax rate of dividend. e.g., 0.2")
+	flag.Parse()
+
 	// prepare history data
-	sAndP500History := parseSAndP500File("./SANDP500.csv")
-	usInflationHistory := parseInflationRate("./USInflationRate.csv")
+	day2PersonalConsumption := readPersonalConsumption("./personal-consumption-expenditures-per-capita.csv")
+	day2SAndP500Price := readSAndP500File("./spx.csv")
+	year2StockDividendYield := readSAndP500DividendYield("./spx-dividend-yield.csv")
+	year2InflationRate := readInflationRate("./us-inflation-rate.csv")
 
-	// get parameters
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("Enter initial capital in USD: ")
-	t, err := reader.ReadString('\n')
-	if err != nil {
-		log.Fatalf("read input err: %+v", err)
-	}
-	initCapital := float64(0)
-	_, err = fmt.Sscanf(t, "%f\n", &initCapital)
-	if err != nil {
-		log.Fatalf("wrong capital: %+v", err)
-	}
-	fmt.Print("Enter withdraw percent only digit part: ")
-	t, err = reader.ReadString('\n')
-	if err != nil {
-		log.Fatalf("read input err: %+v", err)
-	}
-	withdrawPercent := float64(0)
-	_, err = fmt.Sscanf(t, "%f\n", &withdrawPercent)
-	if err != nil {
-		log.Fatalf("wrong withdraw percent: %+v", err)
-	}
-	withdrawPercent /= 100
-	fmt.Print("Enter num of year to spend: ")
-	t, err = reader.ReadString('\n')
-	if err != nil {
-		log.Fatalf("read input err: %+v", err)
-	}
-	numOfYear := 0
-	_, err = fmt.Sscanf(t, "%d\n", &numOfYear)
-	if err != nil {
-		log.Fatalf("wrong year: %+v", err)
-	}
+	var successCount, failCount float64
+	var minWithdrawCount, maxWithdrawCount float64
+	for day, price := range day2SAndP500Price.Day2Price {
+		currMaxWithdrawRate := *maxWithdrawRate
+		currMinWithdrawRate := *minWithdrawRate
 
-	success, failed, na := 0, 0, 0
-	var trace strings.Builder
-	current := sAndP500History.FirstDate
-	if usInflationHistory.FirstDate.After(current) {
-		current = usInflationHistory.FirstDate
-	}
-	end := time.Now()
-	for current.Before(end) {
-		r := runPlan(current, withdrawPercent, initCapital, usInflationHistory, sAndP500History, numOfYear, &trace)
-		if r == resultSuccess {
-			success++
-		} else if r == resultFail {
-			failed++
-		} else {
-			na++
+		consumption, ok := findPersonalConsumption(day, day2PersonalConsumption)
+		if !ok {
+			continue
 		}
-		current = current.AddDate(0, 0, 1)
+		initSaving := consumption / currMaxWithdrawRate
+		// withdraw for consumption of  first year
+		saving := initSaving * (1 - currMaxWithdrawRate)
+		targetSaving := saving
+
+		const (
+			resultNoData = iota
+			resultSuccess
+			resultFail
+		)
+		result := resultSuccess
+		prevYearStockPrice := price
+		var currMinWithdrawCount, currMaxWithdrawCount float64
+		for i := 0; i < *yearToSpend; i++ {
+			aYearLater := day.AddDate(1, 0, 0)
+			sellDay, currStockPrice := findSAndP500DayAndPrice(aYearLater, day2SAndP500Price)
+			if sellDay == nil {
+				result = resultNoData
+				break
+			}
+
+			inflation, ok := year2InflationRate[day.Year()]
+			if !ok {
+				result = resultNoData
+				break
+			}
+			targetSaving = targetSaving * (1 + inflation)
+			currMaxWithdrawRate = currMaxWithdrawRate * (1 + inflation)
+			currMinWithdrawRate = currMinWithdrawRate * (1 + inflation)
+
+			stockPriceRatio := currStockPrice / prevYearStockPrice
+			dividendYield, ok := year2StockDividendYield[day.Year()]
+			if !ok {
+				result = resultNoData
+				break
+			}
+			dividendYield *= (1 - *dividendTaxRate)
+			saving = saving*stockPriceRatio + saving*dividendYield
+			withdrawRate := currMaxWithdrawRate
+			count := &currMaxWithdrawCount
+			if saving < targetSaving {
+				count = &currMinWithdrawCount
+				withdrawRate = currMinWithdrawRate
+			}
+			*count++
+
+			withdraw := withdrawRate * initSaving
+			saving -= withdraw
+			if saving <= 0 {
+				result = resultFail
+				break
+			}
+
+			prevYearStockPrice = currStockPrice
+			day = aYearLater
+		}
+
+		if result == resultSuccess {
+			successCount++
+		} else if result == resultFail {
+			failCount++
+		}
+
+		if result != resultNoData {
+			maxWithdrawCount += currMaxWithdrawCount
+			minWithdrawCount += currMinWithdrawCount
+		}
 	}
-	log.Printf("success = %d, failed = %d, na = %d\n", success, failed, na)
-	log.Printf("success rate = %.3f\n", float64(success)/float64(success+failed))
 
-	fileName := "./fourpercent-" + time.Now().Format(time.RFC3339Nano)
-	ioutil.WriteFile(fileName, []byte(trace.String()), os.ModePerm)
-
-	log.Println("done")
+	log.Println("successCount", successCount, " failCount", failCount, " pass rate", successCount/(successCount+failCount))
+	log.Println("minWithdrawCount", minWithdrawCount, ", maxWithdrawCount", maxWithdrawCount, " min/total", minWithdrawCount/(minWithdrawCount+maxWithdrawCount))
 }
 
-func findSAndP500Price(sAndP500Day time.Time, sAndP500History dateValue) float64 {
+func findPersonalConsumption(date time.Time, monthPersonalConsumption map[time.Time]float64) (float64, bool) {
+	var target time.Time
+	if date.Month() < 4 {
+		target = time.Date(date.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	} else if date.Month() < 7 {
+		target = time.Date(date.Year(), 4, 1, 0, 0, 0, 0, time.UTC)
+	} else if date.Month() < 10 {
+		target = time.Date(date.Year(), 7, 1, 0, 0, 0, 0, time.UTC)
+	} else {
+		target = time.Date(date.Year(), 10, 1, 0, 0, 0, 0, time.UTC)
+	}
+	v, ok := monthPersonalConsumption[target]
+	return v, ok
+}
+
+func findSAndP500DayAndPrice(sAndP500Day time.Time, sAndP500History datePrice) (*time.Time, float64) {
 	for {
-		price, ok := sAndP500History.DV[sAndP500Day]
+		price, ok := sAndP500History.Day2Price[sAndP500Day]
 		if ok {
-			return price
+			return &sAndP500Day, price
 		}
 
 		sAndP500Day = sAndP500Day.AddDate(0, 0, 1)
 		if sAndP500Day.After(sAndP500History.LastDate) {
-			return 0
+			return nil, 0
 		}
 	}
 }
 
-func runPlan(startTime time.Time, withdrawPercent float64, capital float64, cpiHistory, sAndP500History dateValue, numOfYears int, trace io.Writer) result {
-	io.WriteString(trace, "initial conditions ===========================\n")
-	io.WriteString(trace, fmt.Sprintf("capital: %f\n", capital))
-	io.WriteString(trace, fmt.Sprintf("start date: %+v\n", startTime.Format("2006-01-02")))
-
-	withdraw := capital * withdrawPercent
-	io.WriteString(trace, fmt.Sprintf("withdraw: %f\n", withdraw))
-	price := findSAndP500Price(startTime, sAndP500History)
-	if price == 0 {
-		io.WriteString(trace, "no price for the date\n\n\n\n")
-		return resultNoData
-	}
-	io.WriteString(trace, fmt.Sprintf("s&p 500 price of the day: %f\n", price))
-	shares := int((capital - withdraw) / price)
-	if shares <= 0 {
-		io.WriteString(trace, "run out of money\n\n\n\n")
-		return resultFail
-	}
-	io.WriteString(trace, fmt.Sprintf("init hold shares: %d\n", shares))
-	numOfYears--
-
-	currentTime := startTime
-	for i := 0; i < numOfYears; i++ {
-		io.WriteString(trace, "\n\n")
-
-		currentTime = currentTime.AddDate(1, 0, 0)
-		io.WriteString(trace, fmt.Sprintf("currentTime: %+v\n", currentTime))
-
-		// use cpi of last month
-		cpiTime := time.Date(currentTime.Year(), currentTime.Month(), 1, 0, 0, 0, 0, time.UTC)
-		cpiTime = cpiTime.AddDate(0, -1, 0)
-		cpi, ok := cpiHistory.DV[cpiTime]
-		if !ok {
-			io.WriteString(trace, "no more cpi data\n\n\n\n")
-			return resultNoData
-		}
-		io.WriteString(trace, fmt.Sprintf("cpi of %+v: %+v\n", cpiTime, cpi))
-
-		withdraw = withdraw * (1 + (cpi / 100))
-		io.WriteString(trace, fmt.Sprintf("withdraw: %+v\n", withdraw))
-		price := findSAndP500Price(currentTime, sAndP500History)
-		if price == 0 {
-			io.WriteString(trace, "no more s&p 500 data\n\n\n\n")
-			return resultNoData
-		}
-		io.WriteString(trace, fmt.Sprintf("price: %+v\n", price))
-		soldShare := int(math.Ceil(withdraw / price))
-		io.WriteString(trace, fmt.Sprintf("sold share: %+v\n", soldShare))
-		shares -= soldShare
-		io.WriteString(trace, fmt.Sprintf("remain share: %+v\n", shares))
-
-		if shares <= 0 {
-			io.WriteString(trace, "run out of money\n\n\n\n")
-			return resultFail
-		}
-	}
-
-	io.WriteString(trace, "pass the year\n\n\n\n")
-	return resultSuccess
-}
-
-func printFirstN(dv dateValue, n int) {
+func printFirstN(dv datePrice, n int) {
 	count := 0
-	for k, v := range dv.DV {
+	for k, v := range dv.Day2Price {
 		log.Println(k, v)
 		count++
 		if count == n {
@@ -180,65 +152,58 @@ func printFirstN(dv dateValue, n int) {
 	}
 }
 
-func parseInflationRate(path string) dateValue {
+func readInflationRate(path string) map[int]float64 {
 	file, err := os.Open(path)
 	if err != nil {
-		log.Fatalf("open inflation csv %s failed %+v", path, err)
+		log.Fatalf("open csv %s failed %+v", path, err)
 	}
 	defer file.Close()
 
 	reader := csv.NewReader(file)
-	history := dateValue{
-		DV: make(map[time.Time]float64),
-	}
-	numOfRow := 0
+	result := map[int]float64{}
+	// skip header
+	reader.Read()
 	for {
 		row, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			log.Fatalf("read inflation csv %+v", err)
+			log.Fatalf("read csv %s %v", path, err)
 		}
 
-		numOfRow++
-		if numOfRow == 1 {
-			// skip header
-			continue
+		year, err := strconv.Atoi(row[0])
+		if err != nil {
+			log.Fatalf("parse csv %v %v %v", path, err, row)
 		}
 
-		// row[i] is the inflation rate of ith month
-		for i := 1; i <= 12; i++ {
-			avg, err := strconv.ParseFloat(row[i], 64)
-			if err != nil {
-				continue
-			}
-			year, _ := strconv.Atoi(row[0])
-			t := time.Date(year, time.Month(i), 1, 0, 0, 0, 0, time.UTC)
-			history.DV[t] = avg
-
-			if numOfRow == 2 && history.FirstDate.Equal(time.Time{}) {
-				history.FirstDate = t
-			}
-			history.LastDate = t
+		if row[13] == "" {
+			break
 		}
+		value, err := strconv.ParseFloat(row[13], 64)
+		if err != nil {
+			log.Fatalf("parse csv %v %v %v", path, err, row)
+		}
+
+		result[year] = value / 100
 	}
 
-	return history
+	return result
 }
 
-func parseSAndP500File(path string) dateValue {
+func readSAndP500File(path string) datePrice {
 	file, err := os.Open(path)
 	if err != nil {
-		log.Fatalf("open s&p500 csv %s failed %+v", path, err)
+		log.Fatalf("open csv %s failed %v", path, err)
 	}
 	defer file.Close()
 
 	reader := csv.NewReader(file)
-	history := dateValue{
-		DV: make(map[time.Time]float64),
+	history := datePrice{
+		Day2Price: make(map[time.Time]float64),
 	}
-	numOfRow := 0
+	// skip header
+	reader.Read()
 	for {
 		row, err := reader.Read()
 		if err == io.EOF {
@@ -248,22 +213,95 @@ func parseSAndP500File(path string) dateValue {
 			log.Fatalf("read s&p500 csv %+v", err)
 		}
 
-		numOfRow++
-		if numOfRow == 1 {
-			// skip header
-			continue
-		}
-
 		// row[0]:1950-01-03
 		// row[4]:16.66
-		t, _ := time.Parse("2006-01-02", row[0])
-		history.DV[t], _ = strconv.ParseFloat(row[4], 64)
+		t, err := time.Parse("2006-01-02", row[0])
+		if err != nil {
+			log.Fatalf("parse csv %s %v %v", path, err, row)
+		}
+		history.Day2Price[t], err = strconv.ParseFloat(row[4], 64)
+		if err != nil {
+			log.Fatalf("parse csv %s %v %v", path, err, row)
+		}
 
-		if numOfRow == 2 && history.FirstDate.Equal(time.Time{}) {
+		if history.FirstDate.IsZero() {
 			history.FirstDate = t
 		}
 		history.LastDate = t
 	}
 
 	return history
+}
+
+func readPersonalConsumption(path string) map[time.Time]float64 {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Fatalf("open csv %s failed %v", path, err)
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	result := map[time.Time]float64{}
+	// skip header
+	reader.Read()
+	for {
+		row, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatalf("read csv %s  %v %v", path, err, row)
+		}
+
+		// row[0]:1950-01-03
+		// row[1]:1091
+		t, err := time.Parse("2006-01-02", row[0])
+		if err != nil {
+			log.Fatalf("parse csv %s %v %v", path, err, row)
+		}
+		spend, err := strconv.ParseFloat(row[1], 64)
+		if err != nil {
+			log.Fatalf("parse csv %s %v %v", path, err, row)
+		}
+
+		result[t] = spend
+	}
+
+	return result
+}
+
+func readSAndP500DividendYield(path string) map[int]float64 {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Fatalf("open csv %s failed %v", path, err)
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	result := map[int]float64{}
+	// skip header
+	reader.Read()
+	for {
+		row, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatalf("read csv %s %v", path, err)
+		}
+
+		// row[0] Dec 31, 2020
+		// row[1]	1.58%
+		year, err := strconv.Atoi(row[0][len(row[0])-4:])
+		if err != nil {
+			log.Fatalf("parse csv %v %v", err, row)
+		}
+		value, err := strconv.ParseFloat(row[1][:len(row[1])-1], 64)
+		if err != nil {
+			log.Fatalf("parse csv %v %v", err, row)
+		}
+		result[year] = value / 100
+	}
+
+	return result
 }
